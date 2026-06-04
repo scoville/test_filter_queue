@@ -130,6 +130,10 @@ class AsyncTaskFilterQueue:
             while self._queues[level]:
                 self._close_task(self._queues[level].popleft())
 
+    def _ensure_worker(self) -> None:
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._worker(), name="task_queue_worker")
+
     async def submit_task(
         self,
         coroutine: Coroutine[Any, Any, Any],
@@ -182,7 +186,9 @@ class AsyncTaskFilterQueue:
             
             self._evict_queued_below(incoming.level)
             self._queues[incoming.level].append(incoming)
-            
+
+            self._ensure_worker()
+            self._work_available.set()
             return True
 
     async def cancel(self) -> None:
@@ -210,6 +216,24 @@ class AsyncTaskFilterQueue:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._worker_task
 
+    async def _worker(self) -> None:
+        while True:
+            entry: QueuedTask | None = None
+            async with self._lock:
+                if self._stopped and self._preempt is None and not self._has_waiting():
+                    return
+                if self._preempt is not None:
+                    entry = self._preempt
+                    self._preempt = None
+                else:
+                    entry = self._pop_highest_waiting()
+
+            if entry is None:
+                self._work_available.clear()
+                await self._work_available.wait()
+                continue
+
+            await self._execute(entry)
 
     async def _execute(self, entry: QueuedTask) -> None:
         self._running_level = entry.level
