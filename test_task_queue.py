@@ -3,14 +3,14 @@ from collections.abc import Coroutine
 from typing import Any
 
 import pytest
-from priority_task_queue import AsyncPriorityTaskQueue, TaskPriority
+from task_queue import AsyncTaskQueue, TaskPriority
 
 pytestmark = pytest.mark.filterwarnings("ignore::RuntimeWarning")
 
 # Rule 1: Only one task runs at a time
 @pytest.mark.asyncio
 async def test_only_one_task_runs_at_a_time() -> None:
-    queue = AsyncPriorityTaskQueue()
+    queue = AsyncTaskQueue()
     active = 0
     max_active = 0
     lock = asyncio.Lock()
@@ -33,7 +33,7 @@ async def test_only_one_task_runs_at_a_time() -> None:
 # Rule 2: Higher priority tasks not interrupt running tasks if can_interrupt_running is False
 @pytest.mark.asyncio
 async def test_higher_priority_does_not_cancel_running() -> None:
-    queue = AsyncPriorityTaskQueue()
+    queue = AsyncTaskQueue()
     cancelled = asyncio.Event()
     order: list[str] = []
 
@@ -61,7 +61,7 @@ async def test_higher_priority_does_not_cancel_running() -> None:
 # Rule 3: Higher priority tasks evict lower priority tasks
 @pytest.mark.asyncio
 async def test_higher_priority_evicts_lower_queued() -> None:
-    queue = AsyncPriorityTaskQueue()
+    queue = AsyncTaskQueue()
     ran: list[str] = []
 
     async def low() -> None:
@@ -90,7 +90,7 @@ async def test_higher_priority_evicts_lower_queued() -> None:
 # Rule 4-5: FIFO within the same priority
 @pytest.mark.asyncio
 async def test_fifo_within_same_priority() -> None:
-    queue = AsyncPriorityTaskQueue()
+    queue = AsyncTaskQueue()
     order: list[str] = []
 
     async def work(label: str) -> None:
@@ -107,7 +107,7 @@ async def test_fifo_within_same_priority() -> None:
 # Rule 1 (opt-in): Higher priority tasks interrupt running tasks if can_interrupt_running is True
 @pytest.mark.asyncio
 async def test_interrupt_requires_higher_priority_and_flag() -> None:
-    queue = AsyncPriorityTaskQueue()
+    queue = AsyncTaskQueue()
     low_cancelled = asyncio.Event()
     order: list[str] = []
 
@@ -136,7 +136,7 @@ async def test_interrupt_requires_higher_priority_and_flag() -> None:
 # Rule 1 (opt-in): Lower priority tasks cannot interrupt running tasks even though can_interrupt_running is True
 @pytest.mark.asyncio
 async def test_interrupt_flag_without_higher_priority_rejected() -> None:
-    queue = AsyncPriorityTaskQueue()
+    queue = AsyncTaskQueue()
     cancelled = asyncio.Event()
     high_finished = asyncio.Event()
 
@@ -165,7 +165,7 @@ async def test_interrupt_flag_without_higher_priority_rejected() -> None:
 # Rule 6: Do not enqueue an incoming task if any task currently running or queued has strictly higher priority
 @pytest.mark.asyncio
 async def test_rule6_rejects_lower_when_higher_queued() -> None:
-    queue = AsyncPriorityTaskQueue()
+    queue = AsyncTaskQueue()
     ran: list[str] = []
 
     async def blocker() -> None:
@@ -199,7 +199,7 @@ async def test_rule6_rejects_lower_when_higher_queued() -> None:
 # Rule 6: Enqueue an incoming task if no task currently running or queued has strictly higher priority
 @pytest.mark.asyncio
 async def test_rule6_equal_priority_can_queue() -> None:
-    queue = AsyncPriorityTaskQueue()
+    queue = AsyncTaskQueue()
     order: list[str] = []
 
     async def first() -> None:
@@ -220,7 +220,7 @@ async def test_rule6_equal_priority_can_queue() -> None:
 # Test rejected coroutines are closed
 @pytest.mark.asyncio
 async def test_rejected_coroutine_is_closed() -> None:
-    queue = AsyncPriorityTaskQueue()
+    queue = AsyncTaskQueue()
     closed_coroutines: list[Coroutine[Any, Any, Any]] = []
     original_close = queue._close_coroutine
 
