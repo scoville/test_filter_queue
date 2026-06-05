@@ -172,6 +172,10 @@ class Worker:
         finally:
             self.running_task = None
             self._current_execution = None
+            if not self.queue:
+                # for manual turn taking, set user turn
+                # for auto turn taking, enable user mic
+                pass
 
 
 class FilterQueueConsumer:
