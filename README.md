@@ -1,19 +1,18 @@
 # Test Task Queue
 
-This repo tests a serialized async task queue backed by `dict[TaskPriority, deque[QueuedTask]]` to see whether it fulfills our expected rules:
+This repo tests a serialized async task queue backed by `deque[QueuedTask]` to see whether it fulfills our required behavior:
 
-## Expected Rules
+## Required Behavior
 
-| Rule       | Behavior                                                                                                                                                             |
+| No.   | Required Behavior                                                                                                                                                             |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1          | At most one running task; no interrupt by default                                                                                                                    |
-| 1 (opt-in) | `can_interrupt_running=True` **and** `new_priority > running_priority` → cancel running, run new task next                                                           |
-| 2          | Higher priority alone never cancels a running task                                                                                                                   |
-| 3          | On enqueue, remove all **queued** tasks with priority **strictly less** than the incoming task                                                                       |
-| 4–5        | Waiting tasks: max priority first; ties broken by FIFO (per-priority `deque`)                                                                                        |
-| 6          | Do **not** enqueue an incoming task if **any** task currently **running** or **queued** has **strictly higher** priority; close the coroutine and drop (log WARNING) |
+| 1          | Only one task runs at a time.                                                                                                                |
+| 2          | Task from queue do not interrupt running task by default. However, if `can_interrupt_running=True`, higher level task from queue can interrupt running task                                                          |
+| 3          | Higher-level incoming tasks evict all lower-level tasks from queue                                                                                    |
+| 4          | Do not enqueue an incoming task if any task queued has strictly higher priority |
 
-To test whether those rules are fulfilled, run:
+
+To test whether those required behaviors are fulfilled, run:
 
 ```bash
 uv run pytest -v

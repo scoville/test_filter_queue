@@ -5,7 +5,7 @@ from task_queue import FilterQueue, FilterQueueConsumer, QueuedTask, TaskLevel
 
 pytestmark = pytest.mark.filterwarnings("ignore::RuntimeWarning")
 
-# Requirement 1: Only one task runs at a time
+# Required Behavior 1: Only one task runs at a time
 @pytest.mark.asyncio
 async def test_only_one_task_runs_at_a_time() -> None:
     queue = FilterQueue()
@@ -35,7 +35,7 @@ async def test_only_one_task_runs_at_a_time() -> None:
     assert max_active == 1
     consumer.stop_worker()
 
-# Requirement 2a: Higher level task from queue do not interrupt running task if can_interrupt_running is False
+# Required Behavior 2a: Higher level task from queue do not interrupt running task if can_interrupt_running is False
 @pytest.mark.asyncio
 async def test_higher_level_does_not_interrupt_running_task_with_can_interrupt_running_false() -> None:
     queue = FilterQueue()
@@ -70,7 +70,7 @@ async def test_higher_level_does_not_interrupt_running_task_with_can_interrupt_r
     assert order == ["low_done", "high_done"]
     consumer.stop_worker()
 
-# Requirement 2b: Higher level task from queue interrupt running task if can_interrupt_running is True
+# Required Behavior 2b: Higher level task from queue interrupt running task if can_interrupt_running is True
 @pytest.mark.asyncio
 async def test_higher_level_interrupt_running_task_with_can_interrupt_running_true() -> None:
     queue = FilterQueue()
@@ -104,7 +104,7 @@ async def test_higher_level_interrupt_running_task_with_can_interrupt_running_tr
     assert order == ["high_done"]
     consumer.start_worker()
 
-# Requirement 2c: Lower level task cannot interrupt running task even though can_interrupt_running is True
+# Required Behavior 2c: Lower level task cannot interrupt running task even though can_interrupt_running is True
 @pytest.mark.asyncio
 async def  test_higher_level_does_not_interrupt_running_task_with_can_interrupt_running_true() -> None:
     queue = FilterQueue()
@@ -138,7 +138,7 @@ async def  test_higher_level_does_not_interrupt_running_task_with_can_interrupt_
     assert order == ["high_done", "low_done"]
     consumer.stop_worker()
 
-# Requirement 3: Higher-level incoming tasks evict lower priority tasks from queue
+# Required Behavior 3: Higher-level incoming tasks evict lower-level tasks from queue
 @pytest.mark.asyncio
 async def test_higher_level_incoming_tasks_evicts_lower_queued() -> None:
     queue = FilterQueue()
@@ -174,7 +174,7 @@ async def test_higher_level_incoming_tasks_evicts_lower_queued() -> None:
     assert ran == ["low", "critical"]
     consumer.stop_worker()
 
-# Requirement 4: Do not enqueue an incoming task if any task queued has strictly higher priority
+# Required Behavior 4: Do not enqueue an incoming task if any task queued has strictly higher priority
 @pytest.mark.asyncio
 async def test_do_not_enqueue_incoming_task_when_higher_queued() -> None:
     queue = FilterQueue()
@@ -195,16 +195,19 @@ async def test_do_not_enqueue_incoming_task_when_higher_queued() -> None:
         await asyncio.sleep(0)
         ran.append("rejected")
 
+    
     task_blocker = QueuedTask(level=TaskLevel.NORMAL, name="blocker", coroutine=blocker())
     task_high_queued = QueuedTask(level=TaskLevel.HIGH, name="high_queued", coroutine=high_queued())
     task_rejected = QueuedTask(level=TaskLevel.NORMAL, name="rejected", coroutine=rejected())
 
+    # long sleep in broker task, so it has been running when high_queued task and rejected task are submitted
     assert queue.submit_task(task_blocker)
     await asyncio.sleep(0.02)
     assert  queue.submit_task(task_high_queued)
     await asyncio.sleep(0.02)
-
+    # high_queued task is now in queue and try to submit rejected task
     accepted = queue.submit_task(task_rejected)
+    # check whether rejected task is not enqueued
     assert not accepted
     await asyncio.sleep(0.35)
     assert ran == ["blocker", "high_queued"]
