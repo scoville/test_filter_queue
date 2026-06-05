@@ -1,19 +1,16 @@
 import asyncio
-import contextlib
 import logging
 from collections import deque
 from collections.abc import Coroutine
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Literal
-
-from check_for_exceptions import check_for_exceptions
+from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
 
 class TaskLevel(IntEnum):
-    """Level for queued async work. Higher values dominate lower values."""
+    """Level for queued task. Higher values dominate lower values."""
 
     LOW = 0
     NORMAL = 1
@@ -21,232 +18,146 @@ class TaskLevel(IntEnum):
     CRITICAL = 3
 
 
-_LEVELS_DESC = tuple(sorted(TaskLevel, key=lambda p: p.value, reverse=True))
-
-
 @dataclass
 class QueuedTask:
-    """A coroutine waiting to be executed by AsyncTaskQueue."""
+    """A task waiting to be dequeued and executed by a consumer."""
 
     level: TaskLevel
     name: str
     coroutine: Coroutine[Any, Any, Any]
     can_interrupt_running: bool = False
+    timeout: float = 120
+
+class FilterQueue:
+    def __init__(self) -> None:
+        self._queue: deque[QueuedTask] = deque()
 
 
-class AsyncTaskFilterQueue:
-    """Run async coroutines strictly one at a time with level ordering.
-
-    Waiting work is stored in ``dict[TaskLevel, deque[QueuedTask]]``. The worker
-    uses ``popleft`` from the highest non-empty level deque plus an
-    :class:`asyncio.Event` so preempted work does not block behind waiting tasks.
-    """
-
-    def __init__(
+    def submit_task(
         self,
-        task_done_log_exception_lvl: Literal["EXCEPTION", "ERROR", "INFO", "DEBUG"] = "EXCEPTION",
-    ) -> None:
-        """Constructor.
-
-        :param task_done_log_exception_lvl: Log level for exceptions when a task completes.
-            Defaults to "EXCEPTION".
-        """
-        self._queues: dict[TaskLevel, deque[QueuedTask]] = {
-            level: deque() for level in TaskLevel
-        }
-        self._lock = asyncio.Lock()
-        self._work_available = asyncio.Event()
-        self._worker_task: asyncio.Task[None] | None = None
-        self._stopped = False
-
-        self._running_task: asyncio.Task[None] | None = None
-        self._running_level: TaskLevel | None = None
-        self._preempt: QueuedTask | None = None
-
-        self.task_done_log_exception_lvl = task_done_log_exception_lvl
-
-    @property
-    def is_running(self) -> bool:
-        """Check whether a task is currently executing."""
-        return self._running_task is not None and not self._running_task.done()
-
-    @property
-    def queue_size(self) -> int:
-        """Return the number of tasks waiting in the level deques."""
-        return self._waiting_count()
-
-    @staticmethod
-    def _close_coroutine(coroutine: Coroutine[Any, Any, Any]) -> None:
-        coroutine.close()
-
-    def _close_task(self, task: QueuedTask) -> None:
-        self._close_coroutine(task.coroutine)
-
-    def _has_waiting(self) -> bool:
-        return any(self._queues[level] for level in _LEVELS_DESC)
-
-    def _waiting_count(self) -> int:
-        return sum(len(queue) for queue in self._queues.values())
-
-    def _highest_queued_level(self) -> TaskLevel | None:
-        for level in _LEVELS_DESC:
-            if self._queues[level]:
-                return level
-        return None
-
-    def _dominant_level(self) -> TaskLevel | None:
-        queued = self._highest_queued_level()
-        if self._running_level is not None:
-            if queued is None or self._running_level > queued:
-                return self._running_level
-            return queued
-        return queued
-
-    def _evict_queued_below(self, incoming_level: TaskLevel) -> None:
-        for level in TaskLevel:
-            if level >= incoming_level:
-                continue
-            while self._queues[level]:
-                discarded = self._queues[level].popleft()
-                LOGGER.debug(
-                    "Evicting queued task %s (level=%s)",
-                    discarded.name,
-                    discarded.level.name,
-                    extra={
-                        "class_name": self.__class__.__name__,
-                        "task_name": discarded.name,
-                    },
-                )
-                self._close_task(discarded)
-
-    def _pop_highest_waiting(self) -> QueuedTask | None:
-        for level in _LEVELS_DESC:
-            if self._queues[level]:
-                return self._queues[level].popleft()
-        return None
-
-    def _drain_all_waiting(self) -> None:
-        for level in TaskLevel:
-            while self._queues[level]:
-                self._close_task(self._queues[level].popleft())
-
-    def _ensure_worker(self) -> None:
-        if self._worker_task is None or self._worker_task.done():
-            self._worker_task = asyncio.create_task(self._worker(), name="task_queue_worker")
-
-    async def submit_task(
-        self,
-        coroutine: Coroutine[Any, Any, Any],
-        *,
-        level: TaskLevel = TaskLevel.NORMAL,
-        name: str = "unknown",
-        can_interrupt_running: bool = False,
-        timeout: float | None = None,
-        calling_class: type[Any] | None = None,
+        task: QueuedTask
     ) -> bool:
-        """Enqueue a coroutine for serialized execution.
+        """Enqueue a coroutine subject to priority rules.
 
-        :param coroutine: Coroutine to run when scheduled.
+        :param coroutine: Coroutine to run when scheduled by a consumer.
         :param level: Task level. Higher values dominate lower values.
         :param name: Task name for logging and debugging.
         :param can_interrupt_running: If True and level is strictly greater than the
-            running task, cancel the running task and run this task next. Defaults to False.
-        :return: True if accepted; False if rejected by rule 6.
+            running level when, this task in the preempt slot instead of the deques.
+        :return: True if accepted; False if rejected by rule 6 or stopped.
         """
-        incoming = QueuedTask(
-            level=level,
-            name=name,
-            coroutine=coroutine,
-            can_interrupt_running=can_interrupt_running,
-        )
+        # Reject if a strictly higher rank is already at the front
+        if self._queue and self._queue[0].level > task.level:
+            LOGGER.warning(
+                "Rejecting incoming lower-level task %s (level=%s).",
+                task.name,
+                task.level.name,
+            )
+            return False
 
-        async with self._lock:
-            if self._stopped:
-                self._close_task(incoming)
-                return False
 
-            dominant_level = self._dominant_level()
-
-            if dominant_level is not None and incoming.level < dominant_level:
-                LOGGER.warning(
-                    "Rejecting lower-level task %s (level=%s); dominant level is %s",
-                    name,
-                    level.name,
-                    dominant_level.name,
+        #  Evict all tasks from the back that have a strictly lower level
+        while self._queue and self._queue[-1].level < task.level:
+            evicted = self._queue.pop()
+            LOGGER.debug(
+                    "Evicted queued task %s (level=%s) from queue.",
+                    evicted.name,
+                    evicted.level.name,
                     extra={
                         "class_name": self.__class__.__name__,
-                        "task_name": name,
-                        "task_level": level.name,
-                        "dominant_level": dominant_level.name,
+                        "task_name": evicted.name,
                     },
                 )
-                self._close_task(incoming)
-                return False
+        
+        self._queue.append(task)
+        return True
 
-            
-            self._evict_queued_below(incoming.level)
-            self._queues[incoming.level].append(incoming)
+    def peek_highest(self) -> QueuedTask | None:
+        return self._queue[0] if self._queue else None
 
-            self._ensure_worker()
-            self._work_available.set()
-            return True
+    def pop_highest(self) -> QueuedTask | None:
+        return self._queue.popleft() if self._queue else None
 
-    async def cancel(self) -> None:
-        """Cancel the running task, drain the queue, and stop the worker."""
-        async with self._lock:
-            self._stopped = True
-            if self._running_task is not None and not self._running_task.done():
-                self._running_task.cancel()
-            self._drain_all_waiting()
-            if self._preempt is not None:
-                self._close_task(self._preempt)
-                self._preempt = None
-            self._work_available.set()
 
-        if self._running_task is not None:
-            try:
-                await self._running_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:  # noqa: BLE001
-                pass
+class Worker:
+    def __init__(self, queue: FilterQueue) -> None:
+        self.queue = queue
+        self.running_task: QueuedTask | None = None
+        self._current_execution: asyncio.Task | None = None
 
-        if self._worker_task is not None and not self._worker_task.done():
-            self._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._worker_task
-
-    async def _worker(self) -> None:
-        while True:
-            entry: QueuedTask | None = None
-            async with self._lock:
-                if self._stopped and self._preempt is None and not self._has_waiting():
-                    return
-                if self._preempt is not None:
-                    entry = self._preempt
-                    self._preempt = None
-                else:
-                    entry = self._pop_highest_waiting()
-
-            if entry is None:
-                self._work_available.clear()
-                await self._work_available.wait()
-                continue
-
-            await self._execute(entry)
-
-    async def _execute(self, entry: QueuedTask) -> None:
-        self._running_level = entry.level
-        self._running_task = asyncio.create_task(entry.coroutine, name=entry.name)
-        self._running_task.add_done_callback(self._done_callback)
+    async def start_loop(self) -> None:
+        LOGGER.info("Started monitoring loop...")
         try:
-            await self._running_task
-        except asyncio.CancelledError:
-            pass
-        finally:
-            if self._running_task is not None and self._running_task.done():
-                self._running_task = None
-            self._running_level = None
+            while True:
+                highest_queued = self.queue.peek_highest()
 
-    def _done_callback(self, task: asyncio.Task[None]) -> None:
-        check_for_exceptions(task, self.task_done_log_exception_lvl, self.__class__.__name__)
+                # Case 1: Idle worker + task available -> Run it
+                if self.running_task is None and highest_queued is not None:
+                    self._execute_next()
+
+                # Case 2: Active worker + higher rank available -> Preempt
+                elif (
+                    self.running_task is not None 
+                    and highest_queued is not None 
+                    and self.running_task.level < highest_queued.level
+                    and highest_queued.can_interrupt_running
+                ):
+                    LOGGER.warning(
+                        "PREEMPTION TRIPPED! Running: '%s' (Level %s) < Queued: '%s' (Level %s)",
+                        self.running_task.name,
+                        self.running_task.level.name,
+                        highest_queued.name,
+                        highest_queued.level.name,
+                    )
+                    
+                    if self._current_execution:
+                        self._current_execution.cancel()
+                    
+                    # Core swap happens immediately
+                    self._execute_next()
+
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            LOGGER.info("Monitoring loop stopped.")
+    
+
+    def _execute_next(self) -> None:
+        task = self.queue.pop_highest()
+        if task:
+            LOGGER.info("Starting execution: '%s' (Level %s)", task.name, task.level.name)
+            self.running_task = task
+            self._current_execution = asyncio.create_task(self._run_with_timeout(task.coroutine, task.timeout))
+            self._current_execution.add_done_callback(self._handle_execution_completion)
+    
+    async def _run_with_timeout(self, coroutine: Coroutine, timeout: float) -> Any:
+        """Helper coroutine to enforce an execution time limit."""
+        async with asyncio.timeout(timeout):
+            return await coroutine
+
+    def _handle_execution_completion(self, fut: asyncio.Task) -> None:
+        try:
+            fut.result()
+            LOGGER.info("Finished: '%s' (Level %s)", self.running_task.name, self.running_task.level.name)
+        except asyncio.TimeoutError:
+            LOGGER.warning("Timeout: '%s' (Level %s)", self.running_task.name, self.running_task.level.name)
+        except asyncio.CancelledError:
+            LOGGER.info("Aborted: '%s' (Level %s)", self.running_task.name, self.running_task.level.name)
+        except Exception as e:
+            LOGGER.warning("Failed with Error: %s", self.running_task.name, self.running_task.level.name, e)
+        finally:
+            self.running_task = None
+            self._current_execution = None
+
+
+class FilterQueueConsumer:
+    def __init__(self, queue: FilterQueue) -> None:
+        self.worker = Worker(queue)
+        self.worker_loop_task: asyncio.Task | None = None
+
+    def start_worker(self) -> None:
+        self.worker_loop_task = asyncio.create_task(self.worker.start_loop())
+
+    def stop_worker(self) -> None:
+        if self.worker_loop_task:
+            self.worker_loop_task.cancel()
+            self.worker_loop_task = None

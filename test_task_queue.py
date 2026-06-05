@@ -1,16 +1,18 @@
 import asyncio
-from collections.abc import Coroutine
-from typing import Any
 
 import pytest
-from task_queue import AsyncTaskQueue, TaskPriority
+from task_queue import FilterQueue, FilterQueueConsumer, QueuedTask, TaskLevel
 
 pytestmark = pytest.mark.filterwarnings("ignore::RuntimeWarning")
 
-# Rule 1: Only one task runs at a time
+# Requirement 1: Only one task runs at a time
 @pytest.mark.asyncio
 async def test_only_one_task_runs_at_a_time() -> None:
-    queue = AsyncTaskQueue()
+    queue = FilterQueue()
+    consumer = FilterQueueConsumer(queue)
+    consumer.start_worker()
+
+
     active = 0
     max_active = 0
     lock = asyncio.Lock()
@@ -24,17 +26,24 @@ async def test_only_one_task_runs_at_a_time() -> None:
         async with lock:
             active -= 1
 
-    assert await queue.submit_async(work("a", 0.05), priority=TaskPriority.NORMAL, name="a")
-    assert await queue.submit_async(work("b", 0.05), priority=TaskPriority.NORMAL, name="b")
-    await asyncio.sleep(0.2)
-    await queue.cancel()
-    assert max_active == 1
+    task_a = QueuedTask(level=TaskLevel.NORMAL, name="a", coroutine=work("a", 0.05))
+    task_b = QueuedTask(level=TaskLevel.NORMAL, name="b", coroutine=work("b", 0.05))
 
-# Rule 2: Higher priority tasks not interrupt running tasks if can_interrupt_running is False
+    assert queue.submit_task(task_a)
+    assert queue.submit_task(task_b)
+    await asyncio.sleep(0.2)
+    assert max_active == 1
+    consumer.stop_worker()
+
+# Requirement 2a: Higher level task from queue do not interrupt running task if can_interrupt_running is False
 @pytest.mark.asyncio
-async def test_higher_priority_does_not_cancel_running() -> None:
-    queue = AsyncTaskQueue()
-    cancelled = asyncio.Event()
+async def test_higher_level_does_not_interrupt_running_task_with_can_interrupt_running_false() -> None:
+    queue = FilterQueue()
+    consumer = FilterQueueConsumer(queue)
+    consumer.start_worker()
+
+
+    low_cancelled = asyncio.Event()
     order: list[str] = []
 
     async def low() -> None:
@@ -42,26 +51,100 @@ async def test_higher_priority_does_not_cancel_running() -> None:
             await asyncio.sleep(0.2)
             order.append("low_done")
         except asyncio.CancelledError:
-            cancelled.set()
+            low_cancelled.set()
             raise
 
     async def high() -> None:
         await asyncio.sleep(0)
         order.append("high_done")
 
-    # long sleep in low task, so it has beee running when high task are submitted
-    assert await queue.submit_async(low(), priority=TaskPriority.LOW, name="low")
-    await asyncio.sleep(0.02)
-    assert await queue.submit_async(high(), priority=TaskPriority.HIGH, name="high")
-    await asyncio.sleep(0.35)
-    await queue.cancel()
-    assert not cancelled.is_set()
-    assert order == ["low_done", "high_done"]
+    task_low = QueuedTask(level=TaskLevel.LOW, name="low", coroutine=low())
+    task_high = QueuedTask(level=TaskLevel.HIGH, name="high", coroutine=high())
 
-# Rule 3: Higher priority tasks evict lower priority tasks
+    # long sleep in low task, so it has been running when high task are submitted
+    assert queue.submit_task(task_low)
+    await asyncio.sleep(0.02)
+    assert queue.submit_task(task_high)
+    await asyncio.sleep(0.35)
+    assert not low_cancelled.is_set()
+    assert order == ["low_done", "high_done"]
+    consumer.stop_worker()
+
+# Requirement 2b: Higher level task from queue interrupt running task if can_interrupt_running is True
 @pytest.mark.asyncio
-async def test_higher_priority_evicts_lower_queued() -> None:
-    queue = AsyncTaskQueue()
+async def test_higher_level_interrupt_running_task_with_can_interrupt_running_true() -> None:
+    queue = FilterQueue()
+    consumer = FilterQueueConsumer(queue)
+    consumer.start_worker()
+
+    low_cancelled = asyncio.Event()
+    order: list[str] = []
+
+    async def low() -> None:
+        try:
+            await asyncio.sleep(0.2)
+            order.append("low_done")
+        except asyncio.CancelledError:
+            low_cancelled.set()
+            raise
+
+    async def high() -> None:
+        await asyncio.sleep(0)
+        order.append("high_done")
+
+    task_low = QueuedTask(level=TaskLevel.LOW, name="low", coroutine=low())
+    task_high = QueuedTask(level=TaskLevel.HIGH, name="high", coroutine=high(), can_interrupt_running=True)
+
+    # long sleep in low task, so it has been running when high task are submitted
+    assert queue.submit_task(task_low)
+    await asyncio.sleep(0.02)
+    assert queue.submit_task(task_high)
+    await asyncio.sleep(0.35)
+    assert low_cancelled.is_set()
+    assert order == ["high_done"]
+    consumer.start_worker()
+
+# Requirement 2c: Lower level task cannot interrupt running task even though can_interrupt_running is True
+@pytest.mark.asyncio
+async def  test_higher_level_does_not_interrupt_running_task_with_can_interrupt_running_true() -> None:
+    queue = FilterQueue()
+    consumer = FilterQueueConsumer(queue)
+    consumer.start_worker()
+
+    high_cancelled = asyncio.Event()
+    order: list[str] = []
+
+    async def high() -> None:
+        try:
+            await asyncio.sleep(0.2)
+            order.append("high_done")
+        except asyncio.CancelledError:
+            high_cancelled.set()
+            raise
+
+    async def low() -> None:
+        await asyncio.sleep(0)
+        order.append("low_done")
+
+    task_high = QueuedTask(level=TaskLevel.HIGH, name="high", coroutine=high())
+    task_low = QueuedTask(level=TaskLevel.LOW, name="low", coroutine=low(), can_interrupt_running=True)
+
+    # long sleep in high task, so it has been running when low task are submitted
+    assert queue.submit_task(task_high)
+    await asyncio.sleep(0.02)
+    assert queue.submit_task(task_low)
+    await asyncio.sleep(0.35)
+    assert not high_cancelled.is_set()
+    assert order == ["high_done", "low_done"]
+    consumer.stop_worker()
+
+# Requirement 3: Higher-level incoming tasks evict lower priority tasks from queue
+@pytest.mark.asyncio
+async def test_higher_level_incoming_tasks_evicts_lower_queued() -> None:
+    queue = FilterQueue()
+    consumer = FilterQueueConsumer(queue)
+    consumer.start_worker()
+
     ran: list[str] = []
 
     async def low() -> None:
@@ -76,96 +159,28 @@ async def test_higher_priority_evicts_lower_queued() -> None:
         await asyncio.sleep(0)
         ran.append("critical")
 
+    task_low = QueuedTask(level=TaskLevel.LOW, name="low", coroutine=low())
+    task_high = QueuedTask(level=TaskLevel.HIGH, name="high", coroutine=high())
+    task_critical = QueuedTask(level=TaskLevel.CRITICAL, name="critical", coroutine=critical())
+
     # long sleep in low task, so it has beee running when high task and critical task are submitted
-    assert await queue.submit_async(low(), priority=TaskPriority.LOW, name="low")
+    assert queue.submit_task(task_low)
     await asyncio.sleep(0.02)
     # high task and critical task are in queue and thus high task is removed from queue
-    assert await queue.submit_async(high(), priority=TaskPriority.HIGH, name="high")
+    assert queue.submit_task(task_high)
     await asyncio.sleep(0.02)
-    assert await queue.submit_async(critical(), priority=TaskPriority.CRITICAL, name="critical")
+    assert queue.submit_task(task_critical)
     await asyncio.sleep(0.4)
-    await queue.cancel()
     assert ran == ["low", "critical"]
+    consumer.stop_worker()
 
-# Rule 4-5: FIFO within the same priority
+# Requirement 4: Do not enqueue an incoming task if any task queued has strictly higher priority
 @pytest.mark.asyncio
-async def test_fifo_within_same_priority() -> None:
-    queue = AsyncTaskQueue()
-    order: list[str] = []
+async def test_do_not_enqueue_incoming_task_when_higher_queued() -> None:
+    queue = FilterQueue()
+    consumer = FilterQueueConsumer(queue)
+    consumer.start_worker()
 
-    async def work(label: str) -> None:
-        order.append(label)
-        await asyncio.sleep(0.01)
-
-    assert await queue.submit_async(work("first"), priority=TaskPriority.NORMAL, name="first")
-    assert await queue.submit_async(work("second"), priority=TaskPriority.NORMAL, name="second")
-    await asyncio.sleep(0.1)
-    await queue.cancel()
-    assert order == ["first", "second"]
-
-
-# Rule 1 (opt-in): Higher priority tasks interrupt running tasks if can_interrupt_running is True
-@pytest.mark.asyncio
-async def test_interrupt_requires_higher_priority_and_flag() -> None:
-    queue = AsyncTaskQueue()
-    low_cancelled = asyncio.Event()
-    order: list[str] = []
-
-    async def low() -> None:
-        try:
-            await asyncio.sleep(0.3)
-            order.append("low_done")
-        except asyncio.CancelledError:
-            low_cancelled.set()
-            raise
-
-    async def high() -> None:
-        await asyncio.sleep(0)
-        order.append("high_done")
-
-    assert await queue.submit_async(low(), priority=TaskPriority.LOW, name="low")
-    await asyncio.sleep(0.02)
-    assert await queue.submit_async(
-        high(), priority=TaskPriority.HIGH, name="high", can_interrupt_running=True
-    )
-    await asyncio.sleep(0.15)
-    await queue.cancel()
-    assert low_cancelled.is_set()
-    assert order == ["high_done"]
-
-# Rule 1 (opt-in): Lower priority tasks cannot interrupt running tasks even though can_interrupt_running is True
-@pytest.mark.asyncio
-async def test_interrupt_flag_without_higher_priority_rejected() -> None:
-    queue = AsyncTaskQueue()
-    cancelled = asyncio.Event()
-    high_finished = asyncio.Event()
-
-    async def high() -> None:
-        try:
-            await asyncio.sleep(0.2)
-        except asyncio.CancelledError:
-            cancelled.set()
-            raise
-        finally:
-            high_finished.set()
-
-    async def low() -> None:
-        pass
-
-    assert await queue.submit_async(high(), priority=TaskPriority.HIGH, name="high")
-    await asyncio.sleep(0.02)
-    accepted = await queue.submit_async(
-        low(), priority=TaskPriority.LOW, name="low", can_interrupt_running=True
-    )
-    assert not accepted
-    await asyncio.wait_for(high_finished.wait(), timeout=1.0)
-    await queue.cancel()
-    assert not cancelled.is_set()
-
-# Rule 6: Do not enqueue an incoming task if any task currently running or queued has strictly higher priority
-@pytest.mark.asyncio
-async def test_rule6_rejects_lower_when_higher_queued() -> None:
-    queue = AsyncTaskQueue()
     ran: list[str] = []
 
     async def blocker() -> None:
@@ -176,72 +191,21 @@ async def test_rule6_rejects_lower_when_higher_queued() -> None:
         await asyncio.sleep(0)
         ran.append("high_queued")
 
-    assert await queue.submit_async(blocker(), priority=TaskPriority.NORMAL, name="blocker")
-    await asyncio.sleep(0.02)
-    assert await queue.submit_async(high_queued(), priority=TaskPriority.HIGH, name="high_queued")
-    await asyncio.sleep(0.02)
-
     async def rejected() -> None:
         await asyncio.sleep(0)
         ran.append("rejected")
 
-    rejected_coro = rejected()
-    accepted = await queue.submit_async(
-        rejected_coro, priority=TaskPriority.NORMAL, name="normal_rejected"
-    )
-    assert not accepted
-    rejected_coro.close()
+    task_blocker = QueuedTask(level=TaskLevel.NORMAL, name="blocker", coroutine=blocker())
+    task_high_queued = QueuedTask(level=TaskLevel.HIGH, name="high_queued", coroutine=high_queued())
+    task_rejected = QueuedTask(level=TaskLevel.NORMAL, name="rejected", coroutine=rejected())
 
-    await asyncio.sleep(0.35)
-    await queue.cancel()
-    assert ran == ["blocker", "high_queued"]
-
-# Rule 6: Enqueue an incoming task if no task currently running or queued has strictly higher priority
-@pytest.mark.asyncio
-async def test_rule6_equal_priority_can_queue() -> None:
-    queue = AsyncTaskQueue()
-    order: list[str] = []
-
-    async def first() -> None:
-        order.append("first")
-        await asyncio.sleep(0.05)
-
-    async def second() -> None:
-        await asyncio.sleep(0)
-        order.append("second")
-
-    assert await queue.submit_async(first(), priority=TaskPriority.NORMAL, name="first")
-    await asyncio.sleep(0.01)
-    assert await queue.submit_async(second(), priority=TaskPriority.NORMAL, name="second")
-    await asyncio.sleep(0.15)
-    await queue.cancel()
-    assert order == ["first", "second"]
-
-# Test rejected coroutines are closed
-@pytest.mark.asyncio
-async def test_rejected_coroutine_is_closed() -> None:
-    queue = AsyncTaskQueue()
-    closed_coroutines: list[Coroutine[Any, Any, Any]] = []
-    original_close = queue._close_coroutine
-
-    def track_close(coroutine: Coroutine[Any, Any, Any]) -> None:
-        closed_coroutines.append(coroutine)
-        original_close(coroutine)
-
-    queue._close_coroutine = track_close  # type: ignore[method-assign]
-
-    async def high() -> None:
-        await asyncio.sleep(0.15)
-
-    async def low() -> None:
-        pass
-
-    assert await queue.submit_async(high(), priority=TaskPriority.HIGH, name="high")
+    assert queue.submit_task(task_blocker)
     await asyncio.sleep(0.02)
-    low_coro = low()
-    accepted = await queue.submit_async(low_coro, priority=TaskPriority.LOW, name="low")
-    assert not accepted
-    assert low_coro in closed_coroutines
+    assert  queue.submit_task(task_high_queued)
+    await asyncio.sleep(0.02)
 
-    await asyncio.sleep(0.2)
-    await queue.cancel()
+    accepted = queue.submit_task(task_rejected)
+    assert not accepted
+    await asyncio.sleep(0.35)
+    assert ran == ["blocker", "high_queued"]
+    consumer.stop_worker()
