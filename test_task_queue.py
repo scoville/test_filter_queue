@@ -212,3 +212,37 @@ async def test_do_not_enqueue_incoming_task_when_higher_queued() -> None:
     await asyncio.sleep(0.35)
     assert ran == ["blocker", "high_queued"]
     consumer.stop_worker()
+
+# Required Behavior 5: Interrupt running task if its predefined task timeout happens
+@pytest.mark.asyncio
+async def test_task_times_out_when_exceeding_limit() -> None:
+    queue = FilterQueue()
+    consumer = FilterQueueConsumer(queue)
+    consumer.start_worker()
+
+    ran: list[str] = []
+
+    async def slow() -> None:
+        await asyncio.sleep(1.0)
+        ran.append("slow_done")
+
+    async def fast() -> None:
+        await asyncio.sleep(0)
+        ran.append("fast_done")
+
+    task_slow = QueuedTask(
+        level=TaskLevel.NORMAL,
+        name="slow",
+        coroutine=slow(),
+        timeout=0.05,
+    )
+    task_fast = QueuedTask(level=TaskLevel.NORMAL, name="fast", coroutine=fast())
+
+    assert queue.submit_task(task_slow)
+    await asyncio.sleep(0.15)
+    assert "slow_done" not in ran
+
+    assert queue.submit_task(task_fast)
+    await asyncio.sleep(0.15)
+    assert ran == ["fast_done"]
+    consumer.stop_worker()
