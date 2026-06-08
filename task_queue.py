@@ -1,10 +1,10 @@
 import asyncio
 import logging
-import threading
 from collections import deque
-from collections.abc import Callable, Coroutine
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from enum import IntEnum
+from socket import timeout
 from typing import Any
 
 LOGGER = logging.getLogger(__name__)
@@ -41,152 +41,115 @@ class QueuedTask:
         metadata={"description": "Timeout for the coroutine in seconds."}
     )
 
-class FilterQueue:
-    def __init__(self) -> None:
-        self._queue: deque[QueuedTask] = deque()
-        self._lock = threading.Lock()
 
-    def submit_task(
-        self,
-        task: QueuedTask
-    ) -> bool:
+class ConditionalPreemptiveScheduler:
+    def __init__(self):
+        self.queue: deque[QueuedTask] = deque()
+        # Current running task          
+        self.running_task: QueuedTask | None = None
+        # Current execution of asyncio.Task for current running task's coroutine
+        self._current_execution: asyncio.Task | None = None
+        # Flag to indicate whether the queue is currently being processed so that only one process_queue task is running at a time
+        self.is_queue_processing = False
+        # Lock to synchronize access to the queue and running task
+        self._lock = asyncio.Lock()
+ 
+    def get_highest_active_level(self) -> TaskLevel | None:
+        """Get the highest active level currently present in the system (running or queued)."""
+        max_level = None
+        if self.running_task:
+            max_level = self.running_task.level
+        for queued_task in self.queue:
+            if max_level is None or queued_task.level > max_level:
+                max_level = queued_task.level
+        return max_level
+
+    async def submit_task(self, task: QueuedTask) -> bool:
         """Enqueue a incomming task.
-
         :param task: incoming task to be enqueued.
         :return: True if accepted; False if rejected.
         """
-        with self._lock:
-            # Reject if a strictly higher rank is already at the front
-            if self._queue and self._queue[0].level > task.level:
+        async with self._lock:
+            highest_active_level = self.get_highest_active_level()
+            # Reject incomming task if a strictly higher-level task is already running or queued 
+            if highest_active_level is not None and task.level < highest_active_level:
                 LOGGER.warning(
-                    "Rejecting incoming lower-level task %s (level=%s).",
+                        "Rejecting incoming task %s (level=%s) because its level is lower than the highest active level %s",
+                        task.name,
+                        task.level.name,
+                        highest_active_level.name,
+                    )
+                return False
+
+            # Evict all tasks from the back that have a strictly lower level than incoming task
+            while self.queue and self.queue[-1].level < task.level:
+                evicted = self.queue.pop()
+                LOGGER.debug(
+                    "Evicted queued task %s (level=%s) from queue because it is lower than the incoming task %s (level=%s).",
+                    evicted.name,
+                    evicted.level.name,
                     task.name,
                     task.level.name,
                 )
-                return False
 
-            # Evict all tasks from the back that have a strictly lower level
-            while self._queue and self._queue[-1].level < task.level:
-                evicted = self._queue.pop()
-                LOGGER.debug(
-                    "Evicted queued task %s (level=%s) from queue.",
-                    evicted.name,
-                    evicted.level.name,
-                    extra={
-                        "class_name": self.__class__.__name__,
-                        "task_name": evicted.name,
-                    },
-                )
 
-            self._queue.append(task)
+            # Allow tasks to be enqueued
+            self.queue.append(task)
+
+            # Check whether there is a current execution of asyncio.Task for current running task's coroutine
+            if self._current_execution and not self._current_execution.done():
+                # Atomically inspect the next task in queue
+                next_task_in_queue = self.queue[0]
+                # Preemption is triggered if the next task in queue outranks the currently running task and is flagged for preemption
+                if next_task_in_queue.level > self.running_task.level and next_task_in_queue.can_interrupt_running:
+                    LOGGER.debug("Task %s (level=%s) in queue with can_interrupt_running=True interrupt running task %s (level=%s)", 
+                    task.name, 
+                    task.level.name, 
+                    self.running_task.name, 
+                    self.running_task.level.name)
+                    # Cancel running coroutine (triggers CancelledError)
+                    self._current_execution.cancel()
+
+            # Trigger queue processing to keep getting next task from queue and then run it one by one
+            asyncio.create_task(self._process_queue())
+
             return True
 
-    def peek_highest(self) -> QueuedTask | None:
-        with self._lock:
-            return self._queue[0] if self._queue else None
+    async def _process_queue(self):
+        """Process queue to keep getting next task from queue and then run it one by one"""
+        if self.is_queue_processing:
+            return
 
-    def pop_highest(self) -> QueuedTask | None:
-        with self._lock:
-            return self._queue.popleft() if self._queue else None
+        # Set flag to indicate that the queue is currently being processed so that only one process_queue task is running at a time
+        self.is_queue_processing = True
 
-    def pop_highest_if(
-        self, should_pop: Callable[[QueuedTask], bool]
-    ) -> QueuedTask | None:
-        """Atomically inspect the front task and dequeue it if `should_pop` is true."""
-        with self._lock:
-            if not self._queue:
-                return None
-            head = self._queue[0]
-            if not should_pop(head):
-                return None
-            return self._queue.popleft()
+        while self.queue:
+            # Get next task from queue
+            task = self.queue.popleft()
+            
+            self.running_task = task 
 
+            # Wrap coroutine into asyncio.Task
+            self._current_execution = asyncio.create_task(task.coroutine)
+           
+            try:
+                await asyncio.wait_for(asyncio.shield(self._current_execution), timeout=task.timeout)
+                LOGGER.info("Finished: '%s' (Level %s)", self.running_task.name, self.running_task.level.name)
+            except asyncio.TimeoutError:
+                LOGGER.warning("Timeout: '%s' (Level %s)", self.running_task.name, self.running_task.level.name)
+                self._current_execution.cancel()
+            except asyncio.CancelledError:
+                LOGGER.info("Aborted: '%s' (Level %s)", self.running_task.name, self.running_task.level.name)
+            except Exception as e:
+                LOGGER.warning("Failed with Error: %s", self.running_task.name, self.running_task.level.name, e)
 
-class Worker:
-    def __init__(self, queue: FilterQueue) -> None:
-        self.queue = queue
-        self.running_task: QueuedTask | None = None
-        self._current_execution: asyncio.Task | None = None
+        # Reset running task and current execution
+        self.running_task = None
+        self._current_execution = None
 
-    async def start_loop(self) -> None:
-        LOGGER.info("Started monitoring loop...")
-        try:
-            while True:
-                running = self.running_task
+        # for manual turn taking, set user turn
+        # for auto turn taking, enable user mic
+        # todo: implement manual turn taking and auto turn taking here
 
-                # Case 1: Idle worker + task available -> Run it
-                if running is None:
-                    task = self.queue.pop_highest()
-                    if task:
-                        self._start_task(task)
-
-                # Case 2: Active worker + higher rank available -> Preempt
-                else:
-                    task = self.queue.pop_highest_if(
-                        lambda head: (
-                            running.level < head.level and head.can_interrupt_running
-                        )
-                    )
-                    if task:
-                        LOGGER.warning(
-                            "PREEMPTION TRIPPED! Running: '%s' (Level %s) < Queued: '%s' (Level %s)",
-                            running.name,
-                            running.level.name,
-                            task.name,
-                            task.level.name,
-                        )
-
-                        if self._current_execution:
-                            self._current_execution.cancel()
-
-                        self._start_task(task)
-
-                await asyncio.sleep(0.1)
-        except asyncio.CancelledError:
-            LOGGER.info("Monitoring loop stopped.")
-    
-
-    def _start_task(self, task: QueuedTask) -> None:
-        LOGGER.info("Starting execution: '%s' (Level %s)", task.name, task.level.name)
-        self.running_task = task
-        self._current_execution = asyncio.create_task(
-            self._run_with_timeout(task.coroutine, task.timeout)
-        )
-        self._current_execution.add_done_callback(self._handle_execution_completion)
-    
-    async def _run_with_timeout(self, coroutine: Coroutine, timeout: float) -> Any:
-        """Helper coroutine to enforce an execution time limit."""
-        async with asyncio.timeout(timeout):
-            return await coroutine
-
-    def _handle_execution_completion(self, fut: asyncio.Task) -> None:
-        try:
-            fut.result()
-            LOGGER.info("Finished: '%s' (Level %s)", self.running_task.name, self.running_task.level.name)
-        except asyncio.TimeoutError:
-            LOGGER.warning("Timeout: '%s' (Level %s)", self.running_task.name, self.running_task.level.name)
-        except asyncio.CancelledError:
-            LOGGER.info("Aborted: '%s' (Level %s)", self.running_task.name, self.running_task.level.name)
-        except Exception as e:
-            LOGGER.warning("Failed with Error: %s", self.running_task.name, self.running_task.level.name, e)
-        finally:
-            self.running_task = None
-            self._current_execution = None
-            if not self.queue:
-                # for manual turn taking, set user turn
-                # for auto turn taking, enable user mic
-                pass
-
-
-class FilterQueueConsumer:
-    def __init__(self, queue: FilterQueue) -> None:
-        self.worker = Worker(queue)
-        self.worker_loop_task: asyncio.Task | None = None
-
-    def start_worker(self) -> None:
-        self.worker_loop_task = asyncio.create_task(self.worker.start_loop())
-
-    def stop_worker(self) -> None:
-        if self.worker_loop_task:
-            self.worker_loop_task.cancel()
-            self.worker_loop_task = None
+        # Reset flag to indicate that the queue is not currently being processed
+        self.is_queue_processing = False

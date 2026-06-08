@@ -1,6 +1,6 @@
 ---
 name: System Architecture Workflow
-overview: A read-only System Architecture Workflow for the serialized async priority task queue in [task_queue.py](task_queue.py), covering components, data flow, concurrency guarantees, and all five required behaviors from [README.md](README.md).
+overview: System Architecture Workflow for the serialized async priority task queue in [task_queue.py](task_queue.py), covering ConditionalPreemptiveScheduler components, data flow, concurrency, and all required behaviors from [README.md](README.md).
 todos: []
 isProject: false
 ---
@@ -9,7 +9,7 @@ isProject: false
 
 ## High-Level Overview
 
-This system is a **single-worker, serialized async task queue** with priority filtering. Producers submit `QueuedTask` coroutines; one `Worker` dequeues and runs exactly one task at a time, with optional preemption and per-task timeouts.
+This system is a **single-scheduler, serialized async task queue** with priority filtering. Producers `await submit_task(QueuedTask)` on `ConditionalPreemptiveScheduler`; exactly one coroutine runs at a time, with optional preemption on submit, queue eviction, and per-task timeouts.
 
 ```mermaid
 flowchart TB
@@ -17,36 +17,24 @@ flowchart TB
         App[Application / Tests]
     end
 
-    subgraph queueLayer [FilterQueue]
-        Lock[threading.Lock]
+    subgraph scheduler [ConditionalPreemptiveScheduler]
+        Lock[asyncio.Lock]
         Deque["deque of QueuedTask"]
         Submit[submit_task]
-        Pop[pop_highest / pop_highest_if]
+        Process[_process_queue]
+        Running[running_task]
+        Exec[_current_execution]
+        Guard[is_queue_processing]
     end
 
-    subgraph consumerLayer [FilterQueueConsumer]
-        Start[start_worker]
-        Stop[stop_worker]
-        Worker[Worker]
-    end
-
-    subgraph execution [Execution]
-        MonitorLoop[start_loop polling]
-        StartTask[_start_task]
-        RunTimeout[_run_with_timeout]
-        Callback[_handle_execution_completion]
-    end
-
-    App -->|QueuedTask| Submit
+    App -->|await submit_task| Submit
     Submit --> Deque
+    Submit -->|create_task| Process
+    Process --> Deque
+    Process --> Running
+    Process --> Exec
+    Process --> Guard
     Deque --> Lock
-    Start --> MonitorLoop
-    MonitorLoop --> Pop
-    Pop --> StartTask
-    StartTask --> RunTimeout
-    RunTimeout --> Callback
-    Callback -->|running_task = None| MonitorLoop
-    Stop -->|cancel| MonitorLoop
 ```
 
 ## Core Components
@@ -55,194 +43,228 @@ flowchart TB
 |-----------|----------------|
 | [`TaskLevel`](task_queue.py) | Priority enum: `LOW(0) < NORMAL(1) < HIGH(2) < CRITICAL(3)` |
 | [`QueuedTask`](task_queue.py) | Task payload: `level`, `name`, `coroutine`, `can_interrupt_running`, `timeout` |
-| [`FilterQueue`](task_queue.py) | Thread-safe priority-filtered `deque`; accepts/rejects/evicts on submit |
-| [`Worker`](task_queue.py) | Polls queue, runs one task, handles preemption and completion |
-| [`FilterQueueConsumer`](task_queue.py) | Lifecycle wrapper: starts/stops the worker asyncio task |
+| [`ConditionalPreemptiveScheduler`](task_queue.py) | Enqueue filtering, preemption, queue draining, and execution |
 
-## Lifecycle: Startup to Shutdown
+### Scheduler State
+
+| Field | Purpose |
+|-------|---------|
+| `queue` | `deque[QueuedTask]` — FIFO waiting tasks |
+| `running_task` | Currently executing `QueuedTask` |
+| `_current_execution` | `asyncio.Task` wrapping the running coroutine |
+| `is_queue_processing` | Re-entrant guard — only one `_process_queue` loop active |
+| `_lock` | `asyncio.Lock` — synchronizes `submit_task` and queue mutations |
+
+## Lifecycle: Submit to Completion
 
 ```mermaid
 sequenceDiagram
     participant App
-    participant Consumer as FilterQueueConsumer
-    participant Worker
-    participant Queue as FilterQueue
+    participant Scheduler as ConditionalPreemptiveScheduler
+    participant Queue as deque
     participant Exec as asyncio.Task
 
-    App->>Consumer: FilterQueueConsumer(queue)
-    App->>Consumer: start_worker()
-    Consumer->>Worker: create_task(start_loop)
+    App->>Scheduler: await submit_task(task)
+    Scheduler->>Scheduler: async with _lock
+    Scheduler->>Queue: reject / evict / append
+    alt preempt conditions met
+        Scheduler->>Exec: cancel _current_execution
+    end
+    Scheduler->>Scheduler: create_task(_process_queue)
 
-    loop Every 100ms
-        Worker->>Queue: pop_highest or pop_highest_if
-        alt task available
-            Worker->>Worker: _start_task(task)
-            Worker->>Exec: create_task(_run_with_timeout)
-            Exec-->>Worker: done_callback
-            Worker->>Worker: running_task = None
+    loop while queue non-empty
+        Scheduler->>Queue: popleft
+        Scheduler->>Scheduler: running_task = task
+        Scheduler->>Exec: create_task(coroutine)
+        Scheduler->>Exec: await wait_for(shield, timeout)
+        alt success
+            Exec-->>Scheduler: Finished log
+        else timeout
+            Exec-->>Scheduler: TimeoutError, cancel
+        else preempted
+            Exec-->>Scheduler: CancelledError
         end
-        Worker->>Worker: await sleep(0.1)
     end
 
-    App->>Consumer: stop_worker()
-    Consumer->>Worker: cancel start_loop
+    Scheduler->>Scheduler: running_task = None, is_queue_processing = False
 ```
 
 ## Workflow 1: Task Submission (`submit_task`)
 
-All submission logic runs under `threading.Lock` in [`FilterQueue.submit_task`](task_queue.py).
+All submission logic runs under `asyncio.Lock` in [`ConditionalPreemptiveScheduler.submit_task`](task_queue.py).
 
 ```mermaid
 flowchart TD
-    Start[submit_task called] --> Lock[Acquire _lock]
-    Lock --> CheckFront{Front task level > incoming level?}
-    CheckFront -->|Yes| Reject[Return False - Behavior 4]
-    CheckFront -->|No| EvictLoop{Back task level < incoming level?}
+    Start[submit_task called] --> Lock[Acquire asyncio.Lock]
+    Lock --> CheckActive{"incoming level < get_highest_active_level()?"}
+    CheckActive -->|Yes| Reject["Return False - Behavior 4"]
+    CheckActive -->|No| EvictLoop{Back task level < incoming level?}
     EvictLoop -->|Yes| PopBack[pop from back - Behavior 3]
     PopBack --> EvictLoop
-    EvictLoop -->|No| Append[append to back]
-    Append --> Accept[Return True]
-    Reject --> Unlock[Release _lock]
+    EvictLoop -->|No| Append[append to queue]
+    Append --> PreemptCheck{Running task outranked by queue front AND can_interrupt_running?}
+    PreemptCheck -->|Yes| Cancel[cancel _current_execution - Behavior 2]
+    PreemptCheck -->|No| Trigger
+    Cancel --> Trigger[create_task _process_queue]
+    Trigger --> Accept[Return True]
+    Reject --> Unlock[Release lock]
     Accept --> Unlock
 ```
 
 **Priority rules on enqueue:**
-- **Reject (Behavior 4):** If queue front has strictly higher level than incoming task, reject.
+
+- **Reject (Behavior 4):** `get_highest_active_level()` returns the max level among the running task and all queued tasks. Incoming tasks strictly below that level are rejected (covers both higher-queued and higher-running cases).
 - **Evict (Behavior 3):** Remove all strictly lower-level tasks from the back before appending.
-- **Append:** New task always goes to the back; front remains highest-priority waiting task.
+- **Preempt (Behavior 2):** After append, if queue front outranks `running_task` and has `can_interrupt_running=True`, cancel `_current_execution` immediately — preemption is triggered at submit time, not via a polling loop.
+- **Trigger processing:** Every accepted submit spawns `_process_queue` (no-op if already processing).
 
-**Note:** Queue ordering assumes front = next to run. Higher-priority tasks submitted later evict lower ones from the back but do not automatically jump ahead of equal/higher front tasks.
+## Workflow 2: Queue Processing (`_process_queue`)
 
-## Workflow 2: Worker Monitor Loop (`start_loop`)
-
-The worker polls every **100ms** and branches on whether a task is currently running.
+`_process_queue` drains the queue sequentially. The `is_queue_processing` flag prevents concurrent processor loops.
 
 ```mermaid
 flowchart TD
-    LoopStart[Loop iteration] --> ReadRunning[running = self.running_task]
-
-    ReadRunning --> IdleCheck{running is None?}
-    IdleCheck -->|Yes| PopIdle["pop_highest() - atomic dequeue"]
-    PopIdle --> HasTask1{task returned?}
-    HasTask1 -->|Yes| Start1[_start_task]
-    HasTask1 -->|No| Sleep
-
-    IdleCheck -->|No| PopPreempt["pop_highest_if(predicate) - atomic inspect+dequeue"]
-    PopPreempt --> PreemptCheck{head.level > running.level AND can_interrupt_running?}
-    PreemptCheck -->|Yes| Cancel[cancel _current_execution]
-    Cancel --> Start2[_start_task - Behavior 2]
-    PreemptCheck -->|No| Sleep[await sleep 0.1]
-    Start1 --> Sleep
-    Start2 --> Sleep
-    Sleep --> LoopStart
+    Start[_process_queue called] --> Guard{is_queue_processing?}
+    Guard -->|Yes| Return[return early]
+    Guard -->|No| SetFlag[is_queue_processing = True]
+    SetFlag --> Loop{queue non-empty?}
+    Loop -->|Yes| Pop[popleft]
+    Pop --> Run[running_task = task]
+    Run --> Create[create_task coroutine]
+    Create --> Wait["await wait_for(shield, timeout)"]
+    Wait --> Outcome{result}
+    Outcome -->|success| LogDone[log Finished]
+    Outcome -->|TimeoutError| LogTimeout[cancel + log Timeout - Behavior 5]
+    Outcome -->|CancelledError| LogAbort[log Aborted - Behavior 2]
+    Outcome -->|Exception| LogError[log Failed]
+    LogDone --> Loop
+    LogTimeout --> Loop
+    LogAbort --> Loop
+    LogError --> Loop
+    Loop -->|No| Reset["running_task = None, is_queue_processing = False"]
 ```
 
 **Behavior mapping:**
-- **Behavior 1 (one at a time):** Only one `_current_execution` asyncio task active; new work waits until `running_task` is cleared.
-- **Behavior 2 (preemption):** Higher-level queued task with `can_interrupt_running=True` atomically dequeued and running task cancelled.
-- **Behavior 2 inverse:** Lower-level tasks never preempt, even with `can_interrupt_running=True`.
 
-## Workflow 3: Task Execution (`_start_task` → `_run_with_timeout`)
+- **Behavior 1 (one at a time):** `_process_queue` awaits each coroutine before `popleft` on the next; `is_queue_processing` ensures a single drain loop.
+- **Behavior 2 (preemption):** Cancel on submit raises `CancelledError` in the running `wait_for`; processor logs and continues to next queued task.
+- **Behavior 2 inverse:** Lower-level tasks never preempt — preemption requires `next_task_in_queue.level > running_task.level`.
+- **Behavior 5 (timeout):** `asyncio.wait_for(asyncio.shield(...), timeout)` cancels overlong tasks; loop continues to next item.
+
+## Workflow 3: Task Execution
 
 ```mermaid
 sequenceDiagram
-    participant Worker
+    participant Process as _process_queue
     participant AsyncTask as asyncio.Task
     participant Coroutine
 
-    Worker->>Worker: running_task = task
-    Worker->>AsyncTask: create_task(_run_with_timeout)
-    Worker->>AsyncTask: add_done_callback
-
-    AsyncTask->>AsyncTask: async with asyncio.timeout(timeout)
-    AsyncTask->>Coroutine: await coroutine
+    Process->>Process: running_task = task
+    Process->>AsyncTask: create_task(coroutine)
+    Process->>AsyncTask: await wait_for(shield, timeout)
 
     alt completes in time
         Coroutine-->>AsyncTask: return
-        AsyncTask-->>Worker: Finished log
+        AsyncTask-->>Process: log Finished
     else exceeds timeout
-        AsyncTask-->>Worker: TimeoutError - Behavior 5
-    else preempted
-        AsyncTask-->>Worker: CancelledError
+        AsyncTask-->>Process: TimeoutError - Behavior 5
+        Process->>AsyncTask: cancel
+    else preempted on submit
+        AsyncTask-->>Process: CancelledError - Behavior 2
     else coroutine error
-        AsyncTask-->>Worker: Exception log
+        AsyncTask-->>Process: Exception log
     end
 
-    Worker->>Worker: finally: running_task = None
+    Process->>Process: continue loop or reset state
 ```
 
-**Behavior 5 (timeout):** `asyncio.timeout(timeout)` wraps the coroutine. On timeout, `TimeoutError` is caught, worker is freed in `finally`, and the monitor loop can dequeue the next task.
+**Timeout detail:** `asyncio.shield` prevents the inner task from being immediately destroyed on timeout/cancel at the `wait_for` boundary, giving the scheduler control over cleanup via explicit `cancel()`.
 
 ## Workflow 4: Concurrency Model
 
 ```mermaid
 flowchart LR
-    subgraph threadSafe [Thread-safe queue ops]
-        T1[Any OS thread]
-        T2[Event loop thread]
-        T1 -->|submit_task| Lock
-        T2 -->|pop_highest / pop_highest_if| Lock
-        Lock --> Deque
+    subgraph asyncSafe [Asyncio-cooperative concurrency]
+        Submit[submit_task]
+        Process[_process_queue]
+        Lock[asyncio.Lock]
+        Submit -->|async with| Lock
+        Process -->|popleft outside lock| Deque
     end
 
-    subgraph atomic [Peek-pop race fix]
-        OldRisk["OLD: peek_highest then pop_highest - gap between lock releases"]
-        NewFix["NEW: pop_highest_if - single lock scope for inspect+dequeue"]
+    subgraph guards [Concurrency guards]
+        Flag[is_queue_processing - single drain loop]
+        PreemptOnSubmit[preemption decided inside submit lock]
     end
 ```
 
 | Concern | Mechanism |
 |---------|-----------|
-| Cross-thread `submit_task` | `threading.Lock` on all deque mutations |
-| Peek-then-pop mismatch | `pop_highest_if()` — inspect and dequeue atomically |
-| Single-threaded asyncio | No `await` between dequeue decision and `_start_task` in one loop iteration |
-| Worker responsiveness | 100ms polling via `asyncio.sleep(0.1)` (not event-driven wakeup yet) |
+| Concurrent `submit_task` calls | `asyncio.Lock` wraps reject/evict/append/preempt decision |
+| Multiple `_process_queue` invocations | `is_queue_processing` early-return guard |
+| Preemption race | Preempt check runs inside `submit_task` lock before releasing |
+| Event-driven processing | `create_task(_process_queue)` on each accepted submit (no polling) |
+| Cross-thread submit | **Not supported** — `asyncio.Lock` requires event-loop thread |
 
 ## End-to-End Example (Preemption + Eviction)
 
 ```mermaid
 sequenceDiagram
     participant App
-    participant Queue
-    participant Worker
+    participant Scheduler as ConditionalPreemptiveScheduler
+    participant Queue as deque
 
-    App->>Queue: submit LOW running task
-    Worker->>Worker: starts LOW
-    App->>Queue: submit HIGH can_interrupt=True
-    Note over Queue: HIGH appended to queue
-    Worker->>Queue: pop_highest_if preempt predicate
-    Queue-->>Worker: HIGH atomically dequeued
-    Worker->>Worker: cancel LOW, start HIGH
-    App->>Queue: submit CRITICAL
-    Note over Queue: evicts HIGH from back, queue = CRITICAL
-    Worker->>Worker: HIGH completes
-    Worker->>Queue: pop_highest
-    Queue-->>Worker: CRITICAL
+    App->>Scheduler: await submit_task LOW
+    Scheduler->>Queue: enqueue LOW
+    Scheduler->>Scheduler: _process_queue starts LOW
+
+    App->>Scheduler: await submit_task HIGH can_interrupt=True
+    Scheduler->>Queue: enqueue HIGH
+    Scheduler->>Scheduler: cancel LOW _current_execution
+    Note over Scheduler: LOW raises CancelledError, HIGH dequeued next
+
+    App->>Scheduler: await submit_task CRITICAL
+    Note over Queue: evicts HIGH from back
+    Scheduler->>Queue: enqueue CRITICAL
+
+    Note over Scheduler: after LOW abort path, CRITICAL runs
 ```
 
-## State Machine (Worker)
+## State Machine (Scheduler)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Idle: start_loop
-    Idle --> Running: pop_highest returns task
-    Running --> Idle: task completes / timeout / error
-    Running --> Running: preempt higher task
-    Idle --> Idle: queue empty
-    Running --> Idle: cancelled by preempt
-    Idle --> [*]: stop_worker cancel
-    Running --> [*]: stop_worker cancel
+    [*] --> Idle: scheduler created
+    Idle --> Processing: submit_task triggers _process_queue
+    Processing --> Running: popleft, set running_task
+    Running --> Running: await coroutine
+    Running --> Running: preempted, next task dequeued
+    Running --> Idle: queue empty, is_queue_processing = False
+    Idle --> Processing: new submit_task
 ```
+
+## Required Behaviors and Tests
+
+| Behavior | Description | Test |
+|----------|-------------|------|
+| 1 | Only one task runs at a time | `test_only_one_task_runs_at_a_time` |
+| 2a | No preempt by default | `test_higher_level_does_not_interrupt_running_task_with_can_interrupt_running_false` |
+| 2b | Preempt when `can_interrupt_running=True` | `test_higher_level_interrupt_running_task_with_can_interrupt_running_true` |
+| 3 | Higher-level incoming evicts lower queued | `test_higher_level_incoming_tasks_evicts_lower_queued` |
+| 4a | Reject when higher-level queued | `test_do_not_enqueue_incoming_task_when_higher_queued` |
+| 4b | Reject when higher-level running | `test_do_not_enqueue_incoming_task_when_higher_running` |
+| 5 | Timeout stops running task | `test_task_times_out_when_exceeding_limit` |
 
 ## Key Files
 
 - Implementation: [task_queue.py](task_queue.py)
-- Behavior specs + test command: [README.md](README.md)
-- Verification: [test_task_queue.py](test_task_queue.py) (7 tests covering behaviors 1–5)
+- Behavior specs: [README.md](README.md)
+- Verification: [test_task_queue.py](test_task_queue.py) (7 tests)
 
 ## Known Design Notes
 
-- `peek_highest()` remains for read-only inspection but is **not** used by the worker loop (avoids TOCTOU race).
-- `submit_task` is **sync** by design — fast in-memory enqueue, safe with `threading.Lock`.
-- Worker polls every 100ms rather than using an `asyncio.Event` wakeup (acceptable latency tradeoff).
-- Placeholder `pass` in `_handle_execution_completion` (lines 175–178) suggests future integration hooks (e.g. turn-taking / mic control) — not part of current queue behavior.
+- `submit_task` is **async** — uses `asyncio.Lock` and must be called from the event loop.
+- Preemption is **submit-driven** (cancel inside `submit_task`), not poll-driven.
+- `_process_queue` pops outside the submit lock; coordination relies on `is_queue_processing` and sequential await.
+- Placeholder TODO at end of `_process_queue` (lines 151–153) for future turn-taking / mic control hooks.
+- Unused import `from socket import timeout` in `task_queue.py` — likely leftover, not used by scheduler logic.

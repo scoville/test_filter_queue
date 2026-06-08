@@ -1,18 +1,18 @@
 # Test Task Queue
 
-This repo tests a serialized async task queue backed by `deque[QueuedTask]` to see whether it fulfills our required behavior:
+A serialized async priority task queue backed by `deque[QueuedTask]`. Producers submit coroutines via `ConditionalPreemptiveScheduler`; exactly one task runs at a time, with optional preemption, eviction, and per-task timeouts.
 
 ## Required Behaviors
 
-| No.   | Required Behavior                                                                                                                                                             |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1          | Only one task runs at a time.                                                                                                                |
-| 2          | Task from queue do not interrupt running task by default. However, if `can_interrupt_running=True`, higher level task from queue can interrupt running task                                                          |
-| 3          | Higher-level incoming task evict all lower-level tasks from queue                                                                                    |
-| 4          | Do not enqueue an incoming task if any task queued has strictly higher level |
-| 5          | Interrupt running task if its predefined task timeout happens |
+| No. | Required Behavior |
+| --- | --- |
+| 1 | Only one task runs at a time. |
+| 2 | Tasks from the queue do not interrupt a running task by default. If `can_interrupt_running=True`, a higher-level queued task can preempt the running task. |
+| 3 | Higher-level incoming tasks evict all lower-level tasks from the queue. |
+| 4 | Do not enqueue an incoming task if any **queued** or **running** task has a strictly higher level. |
+| 5 | Stop a running task when its predefined `timeout` is exceeded, then continue processing the queue. |
 
-To test whether those required behaviors are fulfilled, run:
+Run the test suite:
 
 ```bash
 uv run pytest -v
