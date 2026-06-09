@@ -1,4 +1,5 @@
 import asyncio
+from functools import partial
 
 import pytest
 from task_queue import ConditionalPreemptiveScheduler, QueuedTask, TaskLevel
@@ -230,33 +231,47 @@ async def test_task_times_out_when_exceeding_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_queue_processing() -> None:
-    scheduler = ConditionalPreemptiveScheduler()
+async def test_on_queue_idle_runs_once_when_queue_drains() -> None:
+    idle_count = 0
 
-    ran: list[str] = []
+    def on_idle() -> None:
+        nonlocal idle_count
+        idle_count += 1
 
-    async def blocker() -> None:
-        ran.append("blocker")
-        await asyncio.sleep(0.2)
+    scheduler = ConditionalPreemptiveScheduler(on_queue_idle=on_idle)
 
-    async def high_queued_a() -> None:
-        await asyncio.sleep(0)
-        ran.append("high_queued_a")
+    async def work(name: str) -> None:
+        await asyncio.sleep(0.05)
+        return name
 
-    async def high_queued_b() -> None:
-        await asyncio.sleep(0)
-        ran.append("high_queued_b")
-
-    
-    task_blocker = QueuedTask(level=TaskLevel.NORMAL, name="blocker", coroutine=blocker())
-    task_high_queued_a = QueuedTask(level=TaskLevel.HIGH, name="high_queued_a", coroutine=high_queued_a())
-    task_high_queued_b = QueuedTask(level=TaskLevel.HIGH, name="high_queued_b", coroutine=high_queued_b())
-
-    # long sleep in broker task, so it has been running when high_queued task and rejected task are submitted
-    assert await scheduler.submit_task(task_blocker)
+    assert await scheduler.submit_task(
+        QueuedTask(level=TaskLevel.NORMAL, name="a", coroutine=work("a"))
+    )
     await asyncio.sleep(0.02)
-    assert await scheduler.submit_task(task_high_queued_a)
-    await asyncio.sleep(0.02)
-    assert await scheduler.submit_task(task_high_queued_b)
-    await asyncio.sleep(0.35)
-    assert ran == ["blocker", "high_queued_a", "high_queued_b"]
+    assert idle_count == 0
+
+    assert await scheduler.submit_task(
+        QueuedTask(level=TaskLevel.NORMAL, name="b", coroutine=work("b"))
+    )
+    await asyncio.sleep(0.2)
+    assert idle_count == 1
+    assert not scheduler.is_queue_processing
+
+
+@pytest.mark.asyncio
+async def test_on_queue_idle_partial_binds_args_before_scheduler() -> None:
+    received: list[str] = []
+
+    def on_idle(mode: str) -> None:
+        received.append(mode)
+
+    scheduler = ConditionalPreemptiveScheduler(on_queue_idle=partial(on_idle, "manual"))
+
+    async def work() -> None:
+        await asyncio.sleep(0.05)
+
+    assert await scheduler.submit_task(
+        QueuedTask(level=TaskLevel.NORMAL, name="a", coroutine=work())
+    )
+    await asyncio.sleep(0.15)
+    assert received == ["manual"]

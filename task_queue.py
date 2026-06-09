@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from collections import deque
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
@@ -42,8 +42,21 @@ class QueuedTask:
 
 
 class ConditionalPreemptiveScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        on_queue_idle: Callable[..., Any] | None = None,
+    ):
+        """Scheduler class that enqueues tasks and processes them sequentially.
+        
+        :param on_queue_idle: callback function that is invoked with no arguments when the queue drains
+                            eg. For manual turn taking, set user turn or for auto turn taking, enable user mic
+                            It can Bind arguments ahead of time with functools.partial, 
+                            e.g. on_queue_idle=partial(callback_function, argument1, argument2, ...).
+        """
         self.queue: deque[QueuedTask] = deque()
+
+        # Callback to invoke when the queue drains
+        self._on_queue_idle = on_queue_idle
         # Current running task          
         self.running_task: QueuedTask | None = None
         # Current execution of asyncio.Task for current running task's coroutine
@@ -110,7 +123,7 @@ class ConditionalPreemptiveScheduler:
                     # Cancel running coroutine (triggers CancelledError)
                     self._current_execution.cancel()
 
-            # Start the processor only when idle; a running processor re-checks the queue after each task.
+            # Start process queue only when queue is not being processed.
             if not self.is_queue_processing:
                 self.is_queue_processing = True
                 asyncio.create_task(self._process_queue())
@@ -118,18 +131,20 @@ class ConditionalPreemptiveScheduler:
             return True
 
     async def _process_queue(self):
-        """Process queue to keep getting next task from queue and then run it one by one."""
+        """Process queue to keep getting next task from queue and then run it one by one. """
+        idle_callback = self._on_queue_idle
+
+        # Process queue until the queue is empty
         while True:
+            # Acquire the lock to synchronize access to the queue and running task
             async with self._lock:
                 if not self.queue:
                     self.running_task = None
                     self._current_execution = None
                     self.is_queue_processing = False
-                    # for manual turn taking, set user turn
-                    # for auto turn taking, enable user mic
-                    # todo: implement manual turn taking and auto turn taking here
-                    return
+                    break
 
+                # Get the next task from the queue
                 task = self.queue.popleft()
                 self.running_task = task
                 self._current_execution = asyncio.create_task(task.coroutine)
@@ -163,3 +178,9 @@ class ConditionalPreemptiveScheduler:
                     self.running_task.level.name,
                     e,
                 )
+        # Invoke the callback if the queue is idle
+        if callable(idle_callback):
+            async with self._lock:
+                still_idle = not self.queue and not self.is_queue_processing
+            if still_idle:
+                idle_callback()
