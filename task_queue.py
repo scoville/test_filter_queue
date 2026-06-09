@@ -4,7 +4,6 @@ from collections import deque
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from enum import IntEnum
-from socket import timeout
 from typing import Any
 
 LOGGER = logging.getLogger(__name__)
@@ -107,49 +106,60 @@ class ConditionalPreemptiveScheduler:
                     task.level.name, 
                     self.running_task.name, 
                     self.running_task.level.name)
+
                     # Cancel running coroutine (triggers CancelledError)
                     self._current_execution.cancel()
 
-            # Trigger queue processing to keep getting next task from queue and then run it one by one
-            asyncio.create_task(self._process_queue())
+            # Start the processor only when idle; a running processor re-checks the queue after each task.
+            if not self.is_queue_processing:
+                self.is_queue_processing = True
+                asyncio.create_task(self._process_queue())
 
             return True
 
     async def _process_queue(self):
-        """Process queue to keep getting next task from queue and then run it one by one"""
-        if self.is_queue_processing:
-            return
+        """Process queue to keep getting next task from queue and then run it one by one."""
+        while True:
+            async with self._lock:
+                if not self.queue:
+                    self.running_task = None
+                    self._current_execution = None
+                    self.is_queue_processing = False
+                    # for manual turn taking, set user turn
+                    # for auto turn taking, enable user mic
+                    # todo: implement manual turn taking and auto turn taking here
+                    return
 
-        # Set flag to indicate that the queue is currently being processed so that only one process_queue task is running at a time
-        self.is_queue_processing = True
+                task = self.queue.popleft()
+                self.running_task = task
+                self._current_execution = asyncio.create_task(task.coroutine)
 
-        while self.queue:
-            # Get next task from queue
-            task = self.queue.popleft()
-            
-            self.running_task = task 
-
-            # Wrap coroutine into asyncio.Task
-            self._current_execution = asyncio.create_task(task.coroutine)
-           
             try:
-                await asyncio.wait_for(asyncio.shield(self._current_execution), timeout=task.timeout)
-                LOGGER.info("Finished: '%s' (Level %s)", self.running_task.name, self.running_task.level.name)
+                await asyncio.wait_for(
+                    asyncio.shield(self._current_execution), timeout=task.timeout
+                )
+                LOGGER.info(
+                    "Finished: '%s' (Level %s)",
+                    self.running_task.name,
+                    self.running_task.level.name,
+                )
             except asyncio.TimeoutError:
-                LOGGER.warning("Timeout: '%s' (Level %s)", self.running_task.name, self.running_task.level.name)
+                LOGGER.warning(
+                    "Timeout: '%s' (Level %s)",
+                    self.running_task.name,
+                    self.running_task.level.name,
+                )
                 self._current_execution.cancel()
             except asyncio.CancelledError:
-                LOGGER.info("Aborted: '%s' (Level %s)", self.running_task.name, self.running_task.level.name)
+                LOGGER.info(
+                    "Aborted: '%s' (Level %s)",
+                    self.running_task.name,
+                    self.running_task.level.name,
+                )
             except Exception as e:
-                LOGGER.warning("Failed with Error: %s", self.running_task.name, self.running_task.level.name, e)
-
-        # Reset running task and current execution
-        self.running_task = None
-        self._current_execution = None
-
-        # for manual turn taking, set user turn
-        # for auto turn taking, enable user mic
-        # todo: implement manual turn taking and auto turn taking here
-
-        # Reset flag to indicate that the queue is not currently being processed
-        self.is_queue_processing = False
+                LOGGER.warning(
+                    "Failed with Error: '%s' (Level %s): %s",
+                    self.running_task.name,
+                    self.running_task.level.name,
+                    e,
+                )

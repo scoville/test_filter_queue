@@ -227,3 +227,36 @@ async def test_task_times_out_when_exceeding_limit() -> None:
     assert await scheduler.submit_task(task_fast)
     await asyncio.sleep(0.15)
     assert ran == ["fast_done"]
+
+
+@pytest.mark.asyncio
+async def test_queue_processing() -> None:
+    scheduler = ConditionalPreemptiveScheduler()
+
+    ran: list[str] = []
+
+    async def blocker() -> None:
+        ran.append("blocker")
+        await asyncio.sleep(0.2)
+
+    async def high_queued_a() -> None:
+        await asyncio.sleep(0)
+        ran.append("high_queued_a")
+
+    async def high_queued_b() -> None:
+        await asyncio.sleep(0)
+        ran.append("high_queued_b")
+
+    
+    task_blocker = QueuedTask(level=TaskLevel.NORMAL, name="blocker", coroutine=blocker())
+    task_high_queued_a = QueuedTask(level=TaskLevel.HIGH, name="high_queued_a", coroutine=high_queued_a())
+    task_high_queued_b = QueuedTask(level=TaskLevel.HIGH, name="high_queued_b", coroutine=high_queued_b())
+
+    # long sleep in broker task, so it has been running when high_queued task and rejected task are submitted
+    assert await scheduler.submit_task(task_blocker)
+    await asyncio.sleep(0.02)
+    assert await scheduler.submit_task(task_high_queued_a)
+    await asyncio.sleep(0.02)
+    assert await scheduler.submit_task(task_high_queued_b)
+    await asyncio.sleep(0.35)
+    assert ran == ["blocker", "high_queued_a", "high_queued_b"]
