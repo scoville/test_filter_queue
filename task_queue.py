@@ -41,12 +41,12 @@ class QueuedTask:
     )
 
 
-class ConditionalPreemptiveScheduler:
+class LevelFilteredTaskQueue:
     def __init__(
         self,
         on_queue_idle: Callable[..., Any] | None = None,
     ):
-        """Scheduler class that enqueues tasks and processes them sequentially.
+        """A class that enqueues tasks and processes them sequentially.
         
         :param on_queue_idle: callback function that is invoked with no arguments when the queue drains
                             eg. For manual turn taking, set user turn or for auto turn taking, enable user mic

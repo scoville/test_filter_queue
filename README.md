@@ -1,6 +1,6 @@
 # Test Task Queue
 
-A serialized async priority task queue backed by `deque[QueuedTask]`. Producers submit coroutines via `ConditionalPreemptiveScheduler`; exactly one task runs at a time, with optional preemption, eviction, and per-task timeouts.
+A serialized async priority task queue backed by `deque[QueuedTask]`. Producers submit coroutines via `LevelFilteredTaskQueue`; exactly one task runs at a time, with optional preemption, eviction, and per-task timeouts.
 
 ## Required Behaviors
 
