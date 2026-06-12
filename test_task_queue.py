@@ -227,6 +227,41 @@ async def test_task_times_out_when_exceeding_limit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_on_queue_idle_not_called_between_back_to_back_tasks() -> None:
+    idle_count = 0
+    first_finished = asyncio.Event()
+
+    def on_idle() -> None:
+        nonlocal idle_count
+        idle_count += 1
+
+    level_filtered_task_queue = LevelFilteredTaskQueue(on_queue_idle=on_idle)
+
+    async def first() -> None:
+        await asyncio.sleep(0.05)
+        first_finished.set()
+
+    async def second() -> None:
+        await asyncio.sleep(0.05)
+
+    assert await level_filtered_task_queue.submit_task(
+        QueuedTask(level=TaskLevel.NORMAL, name="first", coroutine=first())
+    )
+
+    async def submit_second_on_finish() -> None:
+        await first_finished.wait()
+        await level_filtered_task_queue.submit_task(
+            QueuedTask(level=TaskLevel.NORMAL, name="second", coroutine=second())
+        )
+
+    asyncio.create_task(submit_second_on_finish())
+    await asyncio.sleep(0.08)
+    assert idle_count == 0
+    await asyncio.sleep(0.15)
+    assert idle_count == 1
+
+
+@pytest.mark.asyncio
 async def test_on_queue_idle_runs_once_when_queue_drains() -> None:
     idle_count = 0
 
@@ -251,7 +286,7 @@ async def test_on_queue_idle_runs_once_when_queue_drains() -> None:
     )
     await asyncio.sleep(0.2)
     assert idle_count == 1
-    assert not level_filtered_task_queue.is_queue_processing
+    assert not await level_filtered_task_queue.is_queue_processing()
 
 
 @pytest.mark.asyncio
@@ -263,6 +298,52 @@ async def test_on_queue_idle_partial_binds_args_before_level_filtered_task_queue
 
     level_filtered_task_queue = LevelFilteredTaskQueue(on_queue_idle=partial(on_idle, "manual"))
     
+    async def work() -> None:
+        await asyncio.sleep(0.05)
+
+    assert await level_filtered_task_queue.submit_task(
+        QueuedTask(level=TaskLevel.NORMAL, name="a", coroutine=work())
+    )
+    await asyncio.sleep(0.15)
+    assert received == ["manual"]
+
+
+@pytest.mark.asyncio
+async def test_on_queue_idle_awaits_async_callback() -> None:
+    idle_count = 0
+    callback_completed = asyncio.Event()
+
+    async def on_idle() -> None:
+        nonlocal idle_count
+        await asyncio.sleep(0.05)
+        idle_count += 1
+        callback_completed.set()
+
+    level_filtered_task_queue = LevelFilteredTaskQueue(on_queue_idle=on_idle)
+
+    async def work() -> None:
+        await asyncio.sleep(0.05)
+
+    assert await level_filtered_task_queue.submit_task(
+        QueuedTask(level=TaskLevel.NORMAL, name="a", coroutine=work())
+    )
+    await asyncio.wait_for(callback_completed.wait(), timeout=1.0)
+    assert idle_count == 1
+    assert not await level_filtered_task_queue.is_queue_processing()
+
+
+@pytest.mark.asyncio
+async def test_on_queue_idle_partial_binds_args_for_async_callback() -> None:
+    received: list[str] = []
+
+    async def on_idle(mode: str) -> None:
+        await asyncio.sleep(0.02)
+        received.append(mode)
+
+    level_filtered_task_queue = LevelFilteredTaskQueue(
+        on_queue_idle=partial(on_idle, "manual")
+    )
+
     async def work() -> None:
         await asyncio.sleep(0.05)
 

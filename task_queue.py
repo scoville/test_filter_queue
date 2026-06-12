@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import inspect
 import logging
 from collections import deque
 from collections.abc import Callable, Coroutine
@@ -42,47 +44,90 @@ class QueuedTask:
 
 
 class LevelFilteredTaskQueue:
+    """Sequential asyncio task queue with level-based filtering.
+
+    This class is intended for use on a single event loop from coroutines only.
+    It is not thread-safe across OS threads.
+    """
+
     def __init__(
         self,
         on_queue_idle: Callable[..., Any] | None = None,
     ):
         """A class that enqueues tasks and processes them sequentially.
         
-        :param on_queue_idle: callback function that is invoked with no arguments when the queue drains
+        :param on_queue_idle: sync or async callback invoked with no arguments when the queue drains
                             eg. For manual turn taking, set user turn or for auto turn taking, enable user mic
-                            It can Bind arguments ahead of time with functools.partial, 
+                            It can bind arguments ahead of time with functools.partial,
                             e.g. on_queue_idle=partial(callback_function, argument1, argument2, ...).
+                            Async callbacks are awaited before the processor waits for more work.
+                            If work arrives while an async idle callback is running, the callback is cancelled.
         """
-        self.queue: deque[QueuedTask] = deque()
+        self._queue: deque[QueuedTask] = deque()
 
         # Callback to invoke when the queue drains
         self._on_queue_idle = on_queue_idle
-        # Current running task          
-        self.running_task: QueuedTask | None = None
+        # Current running task
+        self._running_task: QueuedTask | None = None
         # Current execution of asyncio.Task for current running task's coroutine
         self._current_execution: asyncio.Task | None = None
-        # Flag to indicate whether the queue is currently being processed so that only one process_queue task is running at a time
-        self.is_queue_processing = False
-        # Lock to synchronize access to the queue and running task
-        self._lock = asyncio.Lock()
- 
-    def get_highest_active_level(self) -> TaskLevel | None:
-        """Get the highest active level currently present in the system (running or queued)."""
+        # True while dequeuing or executing work; False while waiting on an empty queue
+        self._is_queue_processing = False
+        # Condition variable synchronizing queue access and processor wakeups
+        self._cv = asyncio.Condition()
+        # Incremented on each accepted submit; used to detect stale idle notifications
+        self._activity_generation = 0
+        self._processor_task: asyncio.Task | None = None
+        self._idle_task: asyncio.Task | None = None
+
+    def _ensure_processor_started_locked(self) -> None:
+        """Start the long-lived processor. Caller must hold ``_cv``."""
+        if self._processor_task is None or self._processor_task.done():
+            self._processor_task = asyncio.create_task(self._run_processor())
+
+    def _cancel_idle_task_locked(self) -> None:
+        """Cancel an in-flight idle callback. Caller must hold ``_cv``."""
+        if self._idle_task is not None and not self._idle_task.done():
+            self._idle_task.cancel()
+
+    def _highest_active_level_locked(self) -> TaskLevel | None:
+        """Return the highest active level. Caller must hold ``_cv``."""
         max_level = None
-        if self.running_task:
-            max_level = self.running_task.level
-        for queued_task in self.queue:
+        if self._running_task:
+            max_level = self._running_task.level
+        for queued_task in self._queue:
             if max_level is None or queued_task.level > max_level:
                 max_level = queued_task.level
         return max_level
+
+    async def get_highest_active_level(self) -> TaskLevel | None:
+        """Get the highest active level currently present in the system (running or queued)."""
+        async with self._cv:
+            return self._highest_active_level_locked()
+
+    async def is_queue_processing(self) -> bool:
+        """Return True while dequeuing or executing work; False while waiting on an empty queue."""
+        async with self._cv:
+            return self._is_queue_processing
+
+    async def get_running_task(self) -> QueuedTask | None:
+        """Return the task currently executing, if any."""
+        async with self._cv:
+            return self._running_task
+
+    async def queued_task_count(self) -> int:
+        """Return the number of tasks waiting in the queue."""
+        async with self._cv:
+            return len(self._queue)
 
     async def submit_task(self, task: QueuedTask) -> bool:
         """Enqueue a incomming task.
         :param task: incoming task to be enqueued.
         :return: True if accepted; False if rejected.
         """
-        async with self._lock:
-            highest_active_level = self.get_highest_active_level()
+        async with self._cv:
+            self._ensure_processor_started_locked()
+            highest_active_level = self._highest_active_level_locked()
             # Reject incomming task if a strictly higher-level task is already running or queued 
             if highest_active_level is not None and task.level < highest_active_level:
                 LOGGER.warning(
@@ -94,8 +139,8 @@ class LevelFilteredTaskQueue:
                 return False
 
             # Evict all tasks from the back that have a strictly lower level than incoming task
-            while self.queue and self.queue[-1].level < task.level:
-                evicted = self.queue.pop()
+            while self._queue and self._queue[-1].level < task.level:
+                evicted = self._queue.pop()
                 LOGGER.debug(
                     "Evicted queued task %s (level=%s) from queue because it is lower than the incoming task %s (level=%s).",
                     evicted.name,
@@ -106,81 +151,149 @@ class LevelFilteredTaskQueue:
 
 
             # Allow tasks to be enqueued
-            self.queue.append(task)
+            self._queue.append(task)
+            self._activity_generation += 1
+            self._cancel_idle_task_locked()
 
             # Check whether there is a current execution of asyncio.Task for current running task's coroutine
             if self._current_execution and not self._current_execution.done():
                 # Atomically inspect the next task in queue
-                next_task_in_queue = self.queue[0]
+                next_task_in_queue = self._queue[0]
+                running_task = self._running_task
                 # Preemption is triggered if the next task in queue outranks the currently running task and is flagged for preemption
-                if next_task_in_queue.level > self.running_task.level and next_task_in_queue.can_interrupt_running:
-                    LOGGER.debug("Task %s (level=%s) in queue with can_interrupt_running=True interrupt running task %s (level=%s)", 
-                    task.name, 
-                    task.level.name, 
-                    self.running_task.name, 
-                    self.running_task.level.name)
+                if (
+                    running_task is not None
+                    and next_task_in_queue.level > running_task.level
+                    and next_task_in_queue.can_interrupt_running
+                ):
+                    LOGGER.debug(
+                        "Task %s (level=%s) in queue with can_interrupt_running=True interrupt running task %s (level=%s)",
+                        task.name,
+                        task.level.name,
+                        running_task.name,
+                        running_task.level.name,
+                    )
 
                     # Cancel running coroutine (triggers CancelledError)
                     self._current_execution.cancel()
 
-            # Start process queue only when queue is not being processed.
-            if not self.is_queue_processing:
-                self.is_queue_processing = True
-                asyncio.create_task(self._process_queue())
-
+            self._cv.notify()
             return True
 
+    async def _run_processor(self) -> None:
+        """Restart the processor automatically if it crashes unexpectedly."""
+        while True:
+            try:
+                await self._process_queue()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("Queue processor failed unexpectedly; restarting")
+                await asyncio.sleep(0)
+                async with self._cv:
+                    if self._queue:
+                        self._cv.notify()
+
     async def _process_queue(self):
-        """Process queue to keep getting next task from queue and then run it one by one. """
+        """Long-lived processor that waits for work and runs tasks one by one."""
         idle_callback = self._on_queue_idle
 
-        # Process queue until the queue is empty
         while True:
-            # Acquire the lock to synchronize access to the queue and running task
-            async with self._lock:
-                if not self.queue:
-                    self.running_task = None
+            async with self._cv:
+                while not self._queue:
+                    self._running_task = None
                     self._current_execution = None
-                    self.is_queue_processing = False
-                    break
+                    self._is_queue_processing = False
+                    await self._cv.wait()
 
-                # Get the next task from the queue
-                task = self.queue.popleft()
-                self.running_task = task
-                self._current_execution = asyncio.create_task(task.coroutine)
+                self._is_queue_processing = True
+                task = self._queue.popleft()
+                self._running_task = task
+                execution = asyncio.create_task(task.coroutine)
+                self._current_execution = execution
 
             try:
                 await asyncio.wait_for(
-                    asyncio.shield(self._current_execution), timeout=task.timeout
+                    asyncio.shield(execution), timeout=task.timeout
                 )
                 LOGGER.info(
                     "Finished: '%s' (Level %s)",
-                    self.running_task.name,
-                    self.running_task.level.name,
+                    task.name,
+                    task.level.name,
                 )
             except asyncio.TimeoutError:
                 LOGGER.warning(
                     "Timeout: '%s' (Level %s)",
-                    self.running_task.name,
-                    self.running_task.level.name,
+                    task.name,
+                    task.level.name,
                 )
-                self._current_execution.cancel()
+                execution.cancel()
             except asyncio.CancelledError:
                 LOGGER.info(
                     "Aborted: '%s' (Level %s)",
-                    self.running_task.name,
-                    self.running_task.level.name,
+                    task.name,
+                    task.level.name,
                 )
             except Exception as e:
                 LOGGER.warning(
                     "Failed with Error: '%s' (Level %s): %s",
-                    self.running_task.name,
-                    self.running_task.level.name,
+                    task.name,
+                    task.level.name,
                     e,
                 )
-        # Invoke the callback if the queue is idle
-        if callable(idle_callback):
-            async with self._lock:
-                still_idle = not self.queue and not self.is_queue_processing
-            if still_idle:
-                idle_callback()
+            finally:
+                await self._await_execution_finished(execution)
+
+            async with self._cv:
+                if not self._queue:
+                    self._running_task = None
+                    self._current_execution = None
+                    self._is_queue_processing = False
+
+            if callable(idle_callback):
+                await self._invoke_idle_if_still_idle(idle_callback)
+
+    @staticmethod
+    async def _await_execution_finished(execution: asyncio.Task[Any]) -> None:
+        """Wait for a task execution to fully finish, including cancellation cleanup."""
+        if execution.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await execution
+            return
+        with contextlib.suppress(asyncio.CancelledError):
+            await execution
+
+    async def _invoke_idle_if_still_idle(self, idle_callback: Callable[..., Any]) -> None:
+        """Invoke idle callback only if no work arrived while draining finished."""
+        async with self._cv:
+            if self._queue or self._is_queue_processing:
+                return
+            idle_generation = self._activity_generation
+
+        # Let submit_task waiters that were blocked on the condition run before we notify idle.
+        await asyncio.sleep(0)
+
+        async with self._cv:
+            still_idle = (
+                not self._queue
+                and not self._is_queue_processing
+                and self._activity_generation == idle_generation
+            )
+            if not still_idle:
+                return
+            idle_task = asyncio.create_task(self._execute_idle_callback(idle_callback))
+            self._idle_task = idle_task
+
+        try:
+            await idle_task
+        except asyncio.CancelledError:
+            LOGGER.debug("Idle callback cancelled because new work arrived")
+        finally:
+            async with self._cv:
+                if self._idle_task is idle_task:
+                    self._idle_task = None
+
+    async def _execute_idle_callback(self, idle_callback: Callable[..., Any]) -> None:
+        result = idle_callback()
+        if inspect.isawaitable(result):
+            await result
